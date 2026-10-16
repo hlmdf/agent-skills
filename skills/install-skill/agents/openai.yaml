@@ -1,0 +1,4 @@
+interface:
+  display_name: "[自装] 装技能"
+  short_description: "把技能装到本机并登记为自装技能，GitHub 之外的来源也可以"
+  default_prompt: "用 $install-skill 安装这个技能：<仓库链接或目录>"
