@@ -1,9 +1,11 @@
 """Tag self-installed skills so they stand out from the bundled ones.
 
-Adds a `[自装] ` prefix to the SKILL.md frontmatter `description`, which is the
-field hosts display in their skill lists. Idempotent: a skill already carrying
-the tag is skipped. Frontmatter is re-parsed with PyYAML after each edit, and
-the script refuses to write anything that would not parse.
+Ensures both `description` (SKILL.md) and `interface.display_name`
+(agents/openai.yaml) start with exactly one marker — currently `#自装 ` —
+replacing any legacy marker instead of stacking them. The leading character must
+sort below "A": the host's "/" menu compares code units, so a "["-style marker
+sinks to the bottom of the list. Skills outside TARGETS that still carry a
+marker are cleaned. Idempotent; every edit is re-parsed before it is written.
 """
 
 import os
@@ -12,7 +14,12 @@ import sys
 
 import yaml
 
-TAG = "[自装] "
+# 标记的首字符必须是编码小于 "A"(65) 的符号，否则在宿主的技能菜单里会被排到字母后面
+# （`[`=91 就属于这种情况）。`#`=35，在按字符编码和按语言规则两种排序下都排最前。
+TAG = "#自装 "
+# 历史标记：改写时先剥掉，避免叠成 "#自装 [自装] X"。
+LEGACY_TAGS = ["[自装] "]
+MARKERS = [TAG, *LEGACY_TAGS]
 # 用户级技能目录。默认 ~/.agents/skills，可用 USER_SKILLS_ROOT 覆盖。
 SKILLS_ROOT = pathlib.Path(
     os.environ.get("USER_SKILLS_ROOT") or pathlib.Path.home() / ".agents" / "skills"
@@ -42,46 +49,60 @@ UI_EXTRAS = {
 }
 
 
+def strip_markers(value: str) -> str:
+    """剥掉开头任意一个（可能嵌套的）已知标记。"""
+    changed = True
+    while changed:
+        changed = False
+        for marker in MARKERS:
+            if value.startswith(marker):
+                value = value[len(marker) :]
+                changed = True
+    return value
+
+
 def tag_description(text: str) -> tuple[str, bool]:
-    """Return (new_text, changed). Raises on unexpected frontmatter shape."""
+    """Ensure the description starts with exactly one TAG, replacing any legacy marker."""
     lines = text.splitlines(keepends=True)
     if lines[0].strip() != "---":
         raise ValueError("file does not start with YAML frontmatter")
     end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
-
     desc = next(i for i in range(1, end) if lines[i].startswith("description:"))
 
     if lines[desc].rstrip("\r\n").rstrip().endswith((">", "|")):
-        # Folded/literal block: description text starts on the next line.
-        first = desc + 1
-        while not lines[first].strip():
-            first += 1
-        body = lines[first]
-        indent = body[: len(body) - len(body.lstrip())]
-        if body.lstrip().startswith(TAG):
+        # 折叠块：描述文本从下一非空行开始。
+        index = desc + 1
+        while not lines[index].strip():
+            index += 1
+        body = lines[index]
+        content = body.rstrip("\r\n")
+        eol = body[len(content) :]
+        indent = content[: len(content) - len(content.lstrip())]
+        new = f"{indent}{TAG}{strip_markers(content.strip())}{eol}"
+        if new == body:
             return text, False
-        lines[first] = f"{indent}{TAG}{body.lstrip()}"
-    else:
-        if TAG in lines[desc]:
-            return text, False
-        raw = lines[desc].rstrip("\r\n")
-        eol = lines[desc][len(raw) :]
-        stripped = raw[len("description:") :].strip()
-        quoted = len(stripped) > 1 and stripped[0] in "\"'" and stripped[-1] == stripped[0]
-        if quoted and stripped[0] == '"':
-            # Keep the author's double quoting; insert the tag after the opening quote.
-            lines[desc] = f'description: "{TAG}{stripped[1:]}{eol}'
-        else:
-            # Re-emit through PyYAML: a plain scalar starting with "[" is invalid YAML.
-            value = TAG + (stripped[1:-1] if quoted else stripped)
-            dumped = yaml.safe_dump(
-                {"description": value},
-                allow_unicode=True,
-                default_flow_style=False,
-                width=10**9,
-            )
-            lines[desc] = dumped.rstrip("\n") + eol
+        lines[index] = new
+        return "".join(lines), True
 
+    raw = lines[desc].rstrip("\r\n")
+    eol = lines[desc][len(raw) :]
+    value = raw[len("description:") :].strip()
+    quoted = len(value) > 1 and value[0] in "\"'" and value[-1] == value[0]
+    new_value = TAG + strip_markers(value[1:-1] if quoted else value)
+    if quoted and value[0] == '"' and '"' not in new_value:
+        # 保留原作者的引号风格。
+        new_line = f'description: "{new_value}"'
+    else:
+        # 交给 PyYAML 决定引法：以 "#" 开头的裸标量会被当成注释，必须加引号。
+        new_line = yaml.safe_dump(
+            {"description": new_value},
+            allow_unicode=True,
+            default_flow_style=False,
+            width=10**9,
+        ).rstrip("\n")
+    if new_line + eol == lines[desc]:
+        return text, False
+    lines[desc] = new_line + eol
     return "".join(lines), True
 
 
@@ -130,7 +151,7 @@ def tag_ui(path: pathlib.Path, name: str) -> str:
 
 
 def untag_description(text: str) -> tuple[str, bool]:
-    """Strip a `[自装] ` prefix from a SKILL.md description (inverse of tagging)."""
+    """Strip any known marker from a SKILL.md description (inverse of tagging)."""
     lines = text.splitlines(keepends=True)
     if not lines or lines[0].strip() != "---":
         return text, False
@@ -144,19 +165,39 @@ def untag_description(text: str) -> tuple[str, bool]:
 
     head = lines[desc].rstrip("\r\n")
     eol = lines[desc][len(head) :]
-    value = head[len("description:") :]
-    if value.strip() in (">", "|", ">-", "|-", ">+", "|+"):
-        body = desc + 1
-        while body < end and not lines[body].strip():
-            body += 1
-        if body >= end or TAG not in lines[body]:
+    value = head[len("description:") :].strip()
+
+    if value in (">", "|", ">-", "|-", ">+", "|+"):
+        index = desc + 1
+        while index < end and not lines[index].strip():
+            index += 1
+        if index >= end:
             return text, False
-        lines[body] = lines[body].replace(TAG, "", 1)
+        content = lines[index].rstrip("\r\n")
+        indent = content[: len(content) - len(content.lstrip())]
+        cleaned = strip_markers(content.strip())
+        if cleaned == content.strip():
+            return text, False
+        lines[index] = f"{indent}{cleaned}{lines[index][len(content) :]}"
         return "".join(lines), True
 
-    if TAG not in value:
+    quoted = len(value) > 1 and value[0] in "\"'" and value[-1] == value[0]
+    inner = value[1:-1] if quoted else value
+    cleaned = strip_markers(inner)
+    if cleaned == inner:
         return text, False
-    lines[desc] = "description:" + value.replace(TAG, "", 1) + eol
+    if quoted:
+        lines[desc] = f"description: {value[0]}{cleaned}{value[-1]}{eol}"
+    else:
+        lines[desc] = (
+            yaml.safe_dump(
+                {"description": cleaned},
+                allow_unicode=True,
+                default_flow_style=False,
+                width=10**9,
+            ).rstrip("\n")
+            + eol
+        )
     return "".join(lines), True
 
 
